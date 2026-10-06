@@ -71,6 +71,7 @@ details.more{margin-top:10px}
 .tt{width:100%;border-collapse:collapse;font-size:13px;margin-bottom:8px}.tt td,.tt th{padding:7px 4px;border-top:1px solid var(--line);text-align:right}.tt td:first-child,.tt th:first-child{text-align:left}.tt th{color:var(--mu);font-weight:500}.tt tr.sel{background:#222630}.up{color:var(--ok)}.down{color:var(--bad)}
 .lvl{margin:8px 0}.bar{height:6px;background:#0f1013;border-radius:3px;margin:3px 0}.bar i{display:block;height:100%;background:var(--ac2);border-radius:3px}
 .ev{padding:3px 0}
+.notep{color:var(--ac2)}.esets{display:flex;flex-wrap:wrap;gap:6px;margin:4px 0 10px}.esets span{display:flex;gap:2px}.esets input.num{width:64px}.esets input.sm{width:52px}
 .hist{border-top:1px solid var(--line);padding:4px 0}.hist summary{color:var(--tx)}
 .changes{padding-left:18px}.changes li{margin:4px 0}
 .lvrow{display:grid;grid-template-columns:1fr 1.6fr 60px;gap:6px;align-items:center;margin:6px 0;font-size:13px}.lvrow select{font-size:13px;padding:6px;min-height:40px}.lvrow input.num{width:60px}
@@ -264,8 +265,8 @@ function fmtVal(e,v){ if(v==null||v==='') return '–'; if(e.type==='secs') retu
 
 // ---------- state ----------
 function ensureTrack(S,t){ if(!S.tracks[t]) S.tracks[t]={level:DEFAULT_LEVEL[t]||0,sets:setsCfg(t).start,load:null,struggle:0,bumpKey:null,est:{}}; if(!S.tracks[t].est) S.tracks[t].est={}; return S.tracks[t]; }
-function newState(){ const S={v:1,profile:null,body:[],tests:[],sessions:[],tracks:{},meso:{n:0,start:null},rotation:0,active:null,events:[],checkins:[],coachNotes:'',settings:{mesoWeeks:5}}; for(const t in TRACKS) ensureTrack(S,t); return S; }
-function migrate(S){ const d=newState(); for(const k in d) if(S[k]===undefined) S[k]=d[k]; for(const t in TRACKS) ensureTrack(S,t); if(!S.settings.mesoWeeks) S.settings.mesoWeeks=5; return S; }
+function newState(){ const S={v:1,profile:null,body:[],tests:[],sessions:[],tracks:{},meso:{n:0,start:null},rotation:0,active:null,events:[],checkins:[],coachNotes:'',settings:{mesoWeeks:5,share:{body:'none',demo:false,health:false}}}; for(const t in TRACKS) ensureTrack(S,t); return S; }
+function migrate(S){ const d=newState(); for(const k in d) if(S[k]===undefined) S[k]=d[k]; for(const t in TRACKS) ensureTrack(S,t); if(!S.settings.mesoWeeks) S.settings.mesoWeeks=5; if(!S.settings.share) S.settings.share=Object.assign({},SHARE_DEFAULT); return S; }
 
 function addBody(S,m){
   const clean={}; for(const k of ['weight','waist','neck','hip']) if(m[k]!==undefined&&m[k]!==''&&m[k]!=null&&!isNaN(+m[k])&&+m[k]>0) clean[k]=+m[k];
@@ -595,7 +596,24 @@ function parseUtterance(text,S){
     if(v==null){ out.push({kind:'unknown',raw}); continue; }
     out.push({kind:'set',exId:e.id,v,rir,load,sets:Math.max(1,Math.min(10,sets)),raw});
   }
-  return out;
+  // anything not understood becomes a free-text note (consecutive bits merged)
+  const orig=String(text).trim();
+  if(!out.some(a=>a.kind!=='unknown')) return orig?[noteAction(orig)]:[];
+  const res=[];
+  for(const a of out){
+    if(a.kind!=='unknown'){ res.push(a); continue; }
+    const prev=res[res.length-1];
+    if(prev&&prev.kind==='note'){ prev.text+=', '+a.raw; Object.assign(prev,noteAction(prev.text)); }
+    else res.push(noteAction(a.raw));
+  }
+  return res;
+}
+const PAIN_WORDS=/\b(pain|painful|hurts?|hurting|ache|aching|achy|sore|pinch\w*|catch\w*|click\w*|tweak\w*|twinge|niggle)\b/i;
+const PAIN_PARTS=[['shoulder',/\b(shoulders?|delts?|rotator|biceps? tendon|long head)\b/i],['wrist',/\bwrists?\b/i],['elbow',/\belbows?\b/i],['knee',/\bknees?\b/i],['back',/\b(lower back|back)\b/i]];
+function noteAction(text){
+  const a={kind:'note',text,raw:text};
+  if(PAIN_WORDS.test(text)){ const hit=PAIN_PARTS.find(([,re])=>re.test(text)); if(hit) a.pain=hit[0]; }
+  return a;
 }
 
 // ---------- coach prompts ----------
@@ -603,38 +621,64 @@ function levelMenu(t){ return P[t].map((e,i)=>i+'='+e.name).join(' | '); }
 function perfLine(S,exId,n){
   return entriesFor(S,exId,n).reverse().map(h=>{ const e=EX[exId]; const vs=h.sets.map(s=>s.v+(s.rir!=null&&s.rir!==''?'@'+s.rir:'')).join(','); return h.date.slice(5)+': '+vs+(h.target?' (target '+fmtVal(e,h.target.v)+')':''); }).join('; ');
 }
-function checkinPrompt(S,mode){
+const SHARE_DEFAULT={body:'none',demo:false,health:false};
+function fatTrendWord(S){
+  const p=S.profile||{}, bs=bodyStats(S), n=nutrition(S);
+  if(bs.ratePerWeek==null||!n) return 'not enough data yet';
+  const want=n.goalRate, got=bs.ratePerWeek;
+  if(p.focus==='muscle') return got>0.3?'gaining quickly':'stable';
+  if(got>want*0.4) return 'slower than planned';
+  if(got<want*1.7) return 'faster than planned';
+  return 'on track';
+}
+function pct(a,b){ return (a==null||!b)?null:Math.round((a-b)/b*1000)/10; }
+function checkinPrompt(S,mode,share){
+  share=Object.assign({},SHARE_DEFAULT,share||S.settings.share||{});
   const p=S.profile||{}, bs=bodyStats(S), mi=mesoInfo(S,today()), n=nutrition(S);
   const lastCk=S.checkins.length?S.checkins[S.checkins.length-1].date:(S.tests[0]?S.tests[0].date:null);
-  const age=p.birthYear?new Date().getFullYear()-(+p.birthYear):'?';
   const L=[];
   const schema='```json\n{"rbw_adjust":{"levels":{"vpull":1},"sets":{"squat":3},"calorieOffset":0,"goals":{"short":"...","long":"..."},"notes":"2–4 short coaching notes the app will display"}}\n```';
+  const privacy = share.body==='full'&&share.demo&&share.health ? '' : ' Some personal/body details are deliberately withheld for privacy — do not ask for exact body measurements; work with what is given.';
   if(mode==='goals'){
-    L.push('You are my calisthenics and body-recomposition coach. Interview me to pin down my short-term (12-week) and long-term (12-month) goals for physique AND movement skills. Ask 1–2 questions at a time, dig into the why, the trade-offs (fat-loss pace vs skill progress), my time available as a parent, and what success looks like. Then summarise and finish with ONE fenced json block in this schema (omit keys you are not changing; level numbers must come from the menus below):',schema,'');
+    L.push('You are my calisthenics and body-recomposition coach. Interview me to pin down my short-term (12-week) and long-term (12-month) goals for physique AND movement skills. Ask 1–2 questions at a time, dig into the why, the trade-offs (fat-loss pace vs skill progress), my time available as a parent, and what success looks like.'+privacy+' Then summarise and finish with ONE fenced json block in this schema (omit keys you are not changing; level numbers must come from the menus below):',schema,'');
   } else {
-    L.push('You are my calisthenics and body-recomposition coach. I use an offline training app that autoregulates volume RP-style from reps + RIR (reps in reserve) + soreness. Equipment: gymnastics rings, high bar, adjustable 15 kg dumbbells, ankle weights, resistance bands, parallettes, handstand canes, rice bucket. This is my periodic check-in. Please:','1) Briefly assess my progress vs goals (fat loss incl. waist, strength/muscle, skills).','2) Ask me up to 5 focused questions in ONE message, then wait for my answers.','3) After my answers, give concrete recommendations and finish with ONE fenced json block in this schema so the app can import it (omit keys you are not changing; level numbers must come from the menus below; sets = working sets per session for that track, 1–6):',schema,'');
+    L.push('You are my calisthenics and body-recomposition coach. I use an offline training app that autoregulates volume RP-style from reps + RIR (reps in reserve) + soreness. Equipment: gymnastics rings, high bar, adjustable 15 kg dumbbells, ankle weights, resistance bands, parallettes, handstand canes, rice bucket. This is my periodic check-in.'+privacy+' Please:','1) Briefly assess my progress vs goals (fat loss, strength/muscle, skills).','2) Ask me up to 5 focused questions in ONE message, then wait for my answers.','3) After my answers, give concrete recommendations and finish with ONE fenced json block in this schema so the app can import it (omit keys you are not changing; level numbers must come from the menus below; sets = working sets per session for that track, 1–6'+(share.body==='full'?'':'; omit calorieOffset unless I ask')+'):',schema,'');
   }
-  L.push('## Profile',`Sex: ${p.sex||'?'}, age ${age}, height ${p.height||'?'} cm. Focus: ${p.focus||'?'}. Trains ${p.perWeek||'?'} sessions/week × ~${p.minutes||25} min (6-session rotation).`,
+  L.push('## Profile');
+  if(share.demo){ const age=p.birthYear?new Date().getFullYear()-(+p.birthYear):'?'; L.push(`Sex: ${p.sex||'?'}, age ${age}, height ${p.height||'?'} cm.`); }
+  L.push(`Focus: ${p.focus==='fat'?'lose fat first':p.focus||'?'}. Trains ${p.perWeek||'?'} sessions/week × ~${p.minutes||25} min (6-session rotation).`,
     `Short-term goals: ${[].concat(p.skillsShort||[]).join('; ')}${p.goals&&p.goals.short?' | '+p.goals.short:''}`,
-    `Long-term goals: ${[].concat(p.skillsLong||[]).join('; ')}${p.goals&&p.goals.long?' | '+p.goals.long:''}${p.skillsOther?' | '+p.skillsOther:''}`,
-    `Physique targets: weight ${p.targetWeight||'-'} kg, waist ${p.targetWaist||'-'} cm, in ${p.months||'?'} months. Success in 3 mo: ${p.success3||'-'}. In 12 mo: ${p.success12||'-'}.`,
-    `History: ${p.history||'-'}`,'');
-  L.push('## Body',`Latest weight ${bs.weight??'-'} kg (7-day avg ${bs.avg7??'-'}), change since start ${bs.weightChange??'-'} kg, trend ${bs.ratePerWeek??'-'} kg/week (${bs.ratePct??'-'}%/wk).`,
-    `Waist ${bs.waist??'-'} cm (change ${bs.waistChange??'-'}), waist-to-height ${bs.whtr??'-'}, est. body fat (Navy) ${bs.bf??'-'}%, BMI ${bs.bmi??'-'}.`);
-  if(n) L.push(`App nutrition target: ${n.target} kcal/day (TDEE est ${n.tdee}, offset ${n.offset}), protein ${n.protein} g.`);
+    `Long-term goals: ${[].concat(p.skillsLong||[]).join('; ')}${p.goals&&p.goals.long?' | '+p.goals.long:''}${p.skillsOther?' | '+p.skillsOther:''}`);
+  if(share.body==='full') L.push(`Physique targets: weight ${p.targetWeight||'-'} kg, waist ${p.targetWaist||'-'} cm, in ${p.months||'?'} months.`);
+  else if(share.body==='relative'){ const fw=(S.body.find(x=>x.weight!=null)||{}).weight, fwa=(S.body.find(x=>x.waist!=null)||{}).waist;
+    L.push(`Physique targets (relative to start): weight ${p.targetWeight&&fw?pct(+p.targetWeight,fw)+'%':'-'}, waist ${p.targetWaist&&fwa?pct(+p.targetWaist,fwa)+'%':'-'}, in ${p.months||'?'} months.`); }
+  L.push(`What success looks like — 3 months: ${p.success3||'-'}. 12 months: ${p.success12||'-'}.`,`Training history: ${p.history||'-'}`,'');
+  if(share.body==='full'){
+    L.push('## Body',`Latest weight ${bs.weight??'-'} kg (7-day avg ${bs.avg7??'-'}), change since start ${bs.weightChange??'-'} kg, trend ${bs.ratePerWeek??'-'} kg/week (${bs.ratePct??'-'}%/wk).`,
+      `Waist ${bs.waist??'-'} cm (change ${bs.waistChange??'-'}), waist-to-height ${bs.whtr??'-'}, est. body fat (Navy) ${bs.bf??'-'}%, BMI ${bs.bmi??'-'}.`);
+    if(n) L.push(`App nutrition target: ${n.target} kcal/day (TDEE est ${n.tdee}, offset ${n.offset}), protein ${n.protein} g.`);
+  } else if(share.body==='relative'){
+    const fw=S.body.find(x=>x.weight!=null), fwa=S.body.find(x=>x.waist!=null);
+    L.push('## Body (relative changes only)',`Weight change since start: ${fw&&bs.avg7!=null?pct(bs.avg7,fw.weight)+'%':'-'}; current trend ${bs.ratePct??'-'}%/week. Waist change since start: ${fwa&&bs.waist!=null?pct(bs.waist,fwa.waist)+'%':'-'}. Fat-loss trend vs plan: ${fatTrendWord(S)}.`);
+  } else L.push('## Body',`Measurements withheld. Fat-loss trend vs the app's plan: ${fatTrendWord(S)}.`);
   L.push('','## Tests (date: value)');
   TESTS.forEach(t=>{ const s=testSeries(S,t.id); if(s.length) L.push(`- ${t.name} [${t.unit}]: `+s.map(x=>x.date+': '+x.v).join(' → ')); });
-  const sess=S.sessions.filter(s=>!lastCk||s.date>lastCk);
+  if(share.health){ const tn=S.tests.filter(t=>t.notes).map(t=>t.date+': '+t.notes); if(tn.length) L.push('Test notes: '+tn.join(' | ')); }
+  const sess=S.sessions.filter(s=>!lastCk||s.date>=lastCk);
   const since=lastCk||(sess[0]?sess[0].date:today());
   const weeks=Math.max(1,daysBetween(since,today())/7);
-  const eff=sess.filter(s=>s.effort).map(s=>+s.effort), pains=sess.filter(s=>s.pain&&s.pain!=='none').map(s=>s.date+' '+s.pain);
-  L.push('',`## Training since ${lastCk||'start'}`,`Mesocycle ${mi.n}, week ${mi.week}/${mi.len}${mi.deload?' (deload)':''}. Sessions: ${sess.length} (~${r1(sess.length/weeks)}/week). Avg session effort (1–5): ${eff.length?r1(avg(eff)):'-'}. Pain reports: ${pains.join(', ')||'none'}.`);
-  const notes=sess.filter(s=>s.notes).map(s=>s.date+': '+s.notes); if(notes.length) L.push('Session notes: '+notes.join(' | '));
+  const eff=sess.filter(s=>s.effort).map(s=>+s.effort);
+  L.push('',`## Training since ${lastCk||'start'}`,`Mesocycle ${mi.n}, week ${mi.week}/${mi.len}${mi.deload?' (deload)':''}. Sessions: ${sess.length} (~${r1(sess.length/weeks)}/week). Avg session effort (1–5): ${eff.length?r1(avg(eff)):'-'}.`);
+  if(share.health){
+    const pains=sess.filter(s=>s.pain&&s.pain!=='none').map(s=>s.date+' '+s.pain);
+    L.push(`Joint pain reports: ${pains.join(', ')||'none'}.`);
+    const notes=sess.filter(s=>s.notes).map(s=>s.date+': '+s.notes); if(notes.length) L.push('Session notes: '+notes.join(' | '));
+  }
   L.push('Per track — current level, sets, recent performances (value@RIR):');
   for(const t in TRACKS){ const ts=S.tracks[t], cap=gateCap(S,t), e=exAt(t,effLevel(S,t));
     L.push(`- ${t} (${TRACKS[t].name}): level ${ts.level}${cap<ts.level?' (gated to '+Math.max(cap,0)+')':''} = ${e.name}, sets ${ts.sets}${ts.load!=null?', load '+ts.load+' kg':''}. ${cap<0?'[locked until chin-ups & dips unlock]':perfLine(S,e.id,4)}`);
     L.push(`   menu: ${levelMenu(t)}`); }
-  const evs=S.events.filter(e=>!lastCk||e.date>lastCk).map(describeEvent);
+  const evs=S.events.filter(e=>(!lastCk||e.date>lastCk)&&(share.body==='full'||!(e.type==='coach'&&/Calorie/.test(e.text)))).map(describeEvent);
   if(evs.length) L.push('','Auto changes: '+evs.join('; '));
   if(S.coachNotes) L.push('','Previous coach notes: '+S.coachNotes);
   return L.join('\n');
@@ -660,7 +704,7 @@ function applyAdjust(S,adj,commit){
   return ch.map(c=>c.d);
 }
 
-const E={TRACKS,GROUP_NAMES,P,EX,TEMPLATES,WARMUPS,TESTS,today,daysBetween,dnum,avg,avgRIR,exAt,fmtVal,newState,migrate,addBody,mesoInfo,gateCap,effLevel,currentEx,entriesFor,calcTarget,planTrack,planSession,nextTemplate,soreGroups,applySession,describeEvent,levelsFromTests,applyTest,testSeries,bodyStats,nutrition,parseUtterance,checkinPrompt,extractAdjust,applyAdjust,estMinutes,setsCfg,ADJUSTABLE,DEF_LOAD};
+const E={TRACKS,GROUP_NAMES,P,EX,TEMPLATES,WARMUPS,TESTS,today,daysBetween,dnum,avg,avgRIR,exAt,fmtVal,newState,migrate,addBody,mesoInfo,gateCap,effLevel,currentEx,entriesFor,calcTarget,planTrack,planSession,nextTemplate,soreGroups,applySession,describeEvent,levelsFromTests,applyTest,testSeries,bodyStats,nutrition,parseUtterance,checkinPrompt,SHARE_DEFAULT,extractAdjust,applyAdjust,estMinutes,setsCfg,ADJUSTABLE,DEF_LOAD};
 root.E=E; if(typeof module!=='undefined'&&module.exports) module.exports=E;
 })(typeof window!=='undefined'?window:globalThis);
 </script>
@@ -726,21 +770,28 @@ function finishOnboard(){
 
 // ---------- tests ----------
 function vTest(){
-  const first=!S.tests.length;
+  const ed=U.testEdit!=null, redoBase=ed&&S.tests.length===1, first=!S.tests.length||redoBase;
   const tests=E.TESTS.map(t=>`<div class="test"><div class="row"><b class="grow">${esc(t.name)}</b><input class="num" data-bind="t.${t.id}" value="${esc(U.testVals[t.id]??'')}" type="number" inputmode="decimal" step="any" placeholder="${t.unit}"></div><small class="muted">${esc(t.protocol)}</small>${prevTest(t.id)}</div>`).join('');
-  return card(`<h1>${first?'Baseline test':'Retest'}</h1><p>Test fresh, after the warm-up. One all-out attempt per test (handstand: best of 3), ~3 min rest between, same order every time. Stop a set at the first rep that breaks the standard — strict standards make this the most rigorous measure of progress. Split it over two days if you need to; leave anything blank you can't or don't want to test.</p><p class="muted small">Why single-set max rather than "reps in a minute"? A max set with a fixed standard measures strength. Per-minute tests mostly measure pacing and conditioning, so burpees are the one timed test.</p>`)
+  return card(`<h1>${redoBase?'Redo baseline':ed?'Edit latest test ('+S.tests[U.testEdit].date+')':first?'Baseline test':'Retest'}</h1>${redoBase?'<p class="warn small">Saving replaces your baseline and resets your starting levels from these results. Your logged sessions are kept.</p>':''}<p>Test fresh, after the warm-up. One all-out attempt per test (handstand: best of 3), ~3 min rest between, same order every time. Stop a set at the first rep that breaks the standard — strict standards make this the most rigorous measure of progress. Split it over two days if you need to; leave anything blank you can't or don't want to test.</p><p class="muted small">Why single-set max rather than "reps in a minute"? A max set with a fixed standard measures strength. Per-minute tests mostly measure pacing and conditioning, so burpees are the one timed test.</p>`)
    + card(`<h3>Body (optional here)</h3><div class="grid2">${inp('tb','weight',U.testBody.weight??'','Weight (kg)',{num:1})}${inp('tb','waist',U.testBody.waist??'','Waist (cm)',{num:1})}${inp('tb','neck',U.testBody.neck??'','Neck (cm)',{num:1})}${S.profile.sex==='female'?inp('tb','hip',U.testBody.hip??'','Hips (cm)',{num:1}):''}</div>`)
    + card(`<h3>Tests</h3>${tests}`)
-   + `<div class="row gap sticky">${S.tests.length?'<button data-act="view" data-v="today" class="ghost">Cancel</button>':''}<button data-act="saveTest" class="primary grow">Save ${first?'baseline':'retest'}</button></div>`;
+   + card(`${area('tn','notes',U.testNotes||'','Test notes','how each test felt, form issues, anything to remember…')}`)
+   + `<div class="row gap sticky">${S.tests.length?'<button data-act="cancelTest" class="ghost">Cancel</button>':''}<button data-act="saveTest" class="primary grow">Save ${ed&&!redoBase?'changes':first?'baseline':'retest'}</button></div>`;
 }
 function prevTest(id){ const s=E.testSeries(S,id); if(!s.length) return ''; const l=s[s.length-1]; return `<small class="prev">Last: ${l.v} (${l.date})${s.length>1?` · baseline ${s[0].v}`:''}</small>`; }
 function saveTest(){
   const res={}; let n=0; for(const k in U.testVals){ if(U.testVals[k]!==''&&U.testVals[k]!=null){ res[k]=+U.testVals[k]; n++; } }
   if(n<3){ toast('Enter at least 3 tests.'); return; }
-  const r=E.applyTest(S,{date:E.today(),results:res,body:U.testBody});
+  const notes=(U.testNotes||'').trim();
+  if(U.testEdit!=null){
+    if(S.tests.length>1){ const t=S.tests[U.testEdit]; t.results=res; t.notes=notes; E.addBody(S,Object.assign({date:t.date},U.testBody)); U.testEdit=null; U.testVals={}; U.testBody={}; U.testNotes=''; U.view='progress'; save(); render(); return toast('Test updated ✓'); }
+    S.tests=[]; S.meso={n:0,start:null};
+  }
+  U.testEdit=null;
+  const r=E.applyTest(S,{date:E.today(),results:res,body:U.testBody,notes});
   const lines=r.first?Object.keys(E.TRACKS).map(t=>`${E.TRACKS[t].name}: <b>${esc((E.currentEx(S,t)||{name:'locked — unlocks with chin-ups & dips'}).name)}</b>`):(r.events.length?r.events.map(E.describeEvent):['No level jumps from the retest — your training levels are already ahead of or equal to it.']);
   U.summary={title:r.first?'Baseline saved — your starting levels':'Retest saved — new mesocycle started',lines:lines.map(x=>x),html:true,foot:r.first?'Your first session is on Today. Tip: run the goals deep-dive in Coach once to refine the plan.':'Now is a good time for a Coach check-in.'};
-  U.testVals={}; U.testBody={}; U.view=r.first?'today':'coach'; U.modal='summary'; save(); render();
+  U.testVals={}; U.testBody={}; U.testNotes=''; U.view=r.first?'today':'coach'; U.modal='summary'; save(); render();
 }
 
 // ---------- today ----------
@@ -820,7 +871,7 @@ function finishSession(){
 function quickBox(inSession){
   let h=`<div class="quick"><input id="qtext" data-bind="q.text" value="${esc(U.qtext)}" placeholder='"3 pull-ups hard" · "25 second handstand"'><button data-act="mic" class="mic ${U.listening?'on':''}" aria-label="Voice">🎤</button><button data-act="parse">Add</button></div>`;
   if(U.parsed){
-    h+=`<div class="parsed">${U.parsed.map((a,j)=>`<div class="row"><span class="grow ${a.kind==='unknown'?'bad':''}">${esc(describeAction(a))}</span><button data-act="dropParsed" data-j="${j}" class="x">×</button></div>`).join('')}<div class="row gap"><button data-act="cancelParsed" class="ghost">Cancel</button><button data-act="applyParsed" class="primary grow">Confirm ${inSession?'into session':'& save'}</button></div></div>`;
+    h+=`<div class="parsed">${U.parsed.map((a,j)=>`<div class="row"><span class="grow ${a.kind==='note'?'notep':''}">${esc(describeAction(a))}</span><button data-act="dropParsed" data-j="${j}" class="x">×</button></div>`).join('')}<div class="row gap"><button data-act="cancelParsed" class="ghost">Cancel</button>${U.parsed.some(a=>a.kind!=='note')?'<button data-act="allNote" class="ghost">All as note</button>':''}<button data-act="applyParsed" class="primary grow">Confirm ${inSession?'into session':'& save'}</button></div></div>`;
   }
   return card(h,'qcard');
 }
@@ -828,17 +879,26 @@ function describeAction(a){
   if(a.kind==='set'){ const e=E.EX[a.exId]; return `${e.name}: ${a.sets>1?a.sets+' × ':''}${fmtT(e,a.v)}${a.rir!=null?' @RIR '+a.rir:''}${a.load?' · '+a.load+' kg':''}`; }
   if(a.kind==='body') return `${a.field[0].toUpperCase()+a.field.slice(1)}: ${a.value} ${a.field==='weight'?'kg':'cm'}`;
   if(a.kind==='effort') return `Session effort: ${EFFORT[a.value]} (${a.value}/5)`;
+  if(a.kind==='note') return `📝 Note${a.pain?' ('+a.pain+' pain flagged)':''}: ${a.text}`;
   return `Didn't understand: "${a.raw}"`;
+}
+function joinNote(a,b){ a=(a||'').trim(); return a?a+(/[.!?]$/.test(a)?' ':'. ')+b:b; }
+function addNote(text,pain){
+  if(S.active){ S.active.notes=joinNote(S.active.notes,text); if(pain) S.active.pain=pain; return; }
+  let s=[...S.sessions].reverse().find(x=>x.date===E.today());
+  if(!s){ s={id:uid(),date:E.today(),template:'quick',name:'Quick log',entries:{},targets:{}}; S.sessions.push(s); }
+  s.notes=joinNote(s.notes,text); if(pain&&(!s.pain||s.pain==='none')) s.pain=pain;
 }
 function doParse(){
   const t=(U.qtext||'').trim(); if(!t) return toast('Type or say something first.');
-  U.parsed=E.parseUtterance(t,S); if(!U.parsed.length) U.parsed=[{kind:'unknown',raw:t}]; render();
+  U.parsed=E.parseUtterance(t,S); if(!U.parsed.length) U.parsed=[{kind:'note',text:t,raw:t}]; render();
 }
 function applyParsed(){
   const acts=U.parsed.filter(a=>a.kind!=='unknown'); if(!acts.length){ U.parsed=null; return render(); }
   const msgs=[]; let quick=null;
   for(const a of acts){
     if(a.kind==='body'){ E.addBody(S,{date:E.today(),[a.field]:a.value}); msgs.push('body'); }
+    else if(a.kind==='note'){ addNote(a.text,a.pain); }
     else if(a.kind==='effort'){ if(S.active){ S.active.effort=a.value; U.fin.effort=a.value; } else { const s=[...S.sessions].reverse().find(x=>x.date===E.today()); if(s) s.effort=a.value; } }
     else if(a.kind==='set'){
       const e=E.EX[a.exId];
@@ -875,11 +935,11 @@ function vLog(){
   let h=`<h2 class="pad">Quick log</h2>`+quickBox(false);
   h+=card(`<p class="muted small">Say or type things like: "3 pull ups hard", "3 sets of 5 dips rir 2", "25 second handstand, 30 seconds, 18 seconds", "goblet squat 12 with 12.5 kg easy", "weight 92.4", "waist 98", "high effort session". Outside a session, sets go into a Quick log entry for today.</p>`);
   const bf=U.bodyForm;
-  h+=card(`<h3>Body measurements</h3><div class="grid2">${inp('bm','date',bf.date,'Date',{ph:'YYYY-MM-DD'})}${inp('bm','weight',bf.weight??'','Weight (kg)',{num:1})}${inp('bm','waist',bf.waist??'','Waist (cm)',{num:1})}${inp('bm','neck',bf.neck??'','Neck (cm)',{num:1})}${S.profile.sex==='female'?inp('bm','hip',bf.hip??'','Hips (cm)',{num:1}):''}</div><button data-act="saveBody" class="primary">Save measurement</button>`);
+  h+=card(`<h3 id="bodyCard">${U.bodyEdit?'Edit measurements — '+esc(U.bodyEdit):'Body measurements'}</h3><div class="grid2">${inp('bm','date',bf.date,'Date',{ph:'YYYY-MM-DD'})}${inp('bm','weight',bf.weight??'','Weight (kg)',{num:1})}${inp('bm','waist',bf.waist??'','Waist (cm)',{num:1})}${inp('bm','neck',bf.neck??'','Neck (cm)',{num:1})}${S.profile.sex==='female'?inp('bm','hip',bf.hip??'','Hips (cm)',{num:1}):''}</div><div class="row gap">${U.bodyEdit?'<button data-act="cancelBody" class="ghost">Cancel</button>':''}<button data-act="saveBody" class="primary grow">${U.bodyEdit?'Save changes':'Save measurement'}</button></div>${U.bodyEdit?'<p class="muted xs">Clear a box to remove that value.</p>':''}`);
   const ss=[...S.sessions].reverse().slice(0,40);
-  h+=card(`<h3>Session history</h3>${ss.length?ss.map(s=>`<details class="hist"><summary><span>${s.date.slice(5)}</span> <b>${esc(s.name)}</b> <span class="muted">${s.effort?EFFORT[s.effort]:''}</span></summary>${Object.keys(s.entries).map(id=>{const e=E.EX[id];return `<div class="small">${esc(e?e.name:id)}: ${s.entries[id].map(x=>x.v+(x.rir!=null&&x.rir!==''?'@'+x.rir:'')+(x.load?' ('+x.load+'kg)':'')).join(', ')}</div>`;}).join('')}${s.pain&&s.pain!=='none'?`<div class="warn small">Pain: ${esc(s.pain)}</div>`:''}${s.notes?`<div class="muted small">${esc(s.notes)}</div>`:''}${(s.events||[]).map(ev=>`<div class="ev small">${esc(E.describeEvent(ev))}</div>`).join('')}<button data-act="delSess" data-id="${s.id}" class="ghost xs">Delete session</button></details>`).join(''):'<p class="muted">No sessions yet.</p>'}<p class="muted xs">Deleting a session doesn't undo level changes it caused — adjust those in More → Levels.</p>`);
+  h+=card(`<h3>Session history</h3>${ss.length?ss.map(s=>`<details class="hist"><summary><span>${s.date.slice(5)}</span> <b>${esc(s.name)}</b> <span class="muted">${s.effort?EFFORT[s.effort]:''}</span></summary>${Object.keys(s.entries).map(id=>{const e=E.EX[id];return `<div class="small">${esc(e?e.name:id)}: ${s.entries[id].map(x=>x.v+(x.rir!=null&&x.rir!==''?'@'+x.rir:'')+(x.load?' ('+x.load+'kg)':'')).join(', ')}</div>`;}).join('')}${s.pain&&s.pain!=='none'?`<div class="warn small">Pain: ${esc(s.pain)}</div>`:''}${s.notes?`<div class="muted small pre">${esc(s.notes)}</div>`:''}${(s.events||[]).map(ev=>`<div class="ev small">${esc(E.describeEvent(ev))}</div>`).join('')}<div class="row gap"><button data-act="editSess" data-id="${s.id}" class="xs">Edit</button><button data-act="delSess" data-id="${s.id}" class="ghost xs">Delete</button></div></details>`).join(''):'<p class="muted">No sessions yet.</p>'}<p class="muted xs">Deleting a session doesn't undo level changes it caused — adjust those in More → Levels.</p>`);
   const bl=[...S.body].reverse().slice(0,12);
-  if(bl.length) h+=card(`<h3>Body log</h3>${bl.map(b=>`<div class="row small"><span class="grow">${b.date} · ${['weight','waist','neck','hip'].filter(k=>b[k]!=null).map(k=>k+' '+b[k]).join(' · ')}</span><button data-act="delBody" data-d="${b.date}" class="x">×</button></div>`).join('')}`);
+  if(bl.length) h+=card(`<h3>Body log</h3>${bl.map(b=>`<div class="row small"><span class="grow">${b.date} · ${['weight','waist','neck','hip'].filter(k=>b[k]!=null).map(k=>k+' '+b[k]).join(' · ')}</span><button data-act="editBody" data-d="${b.date}" class="x" aria-label="Edit">✎</button><button data-act="delBody" data-d="${b.date}" class="x">×</button></div>`).join('')}`);
   return h;
 }
 
@@ -909,7 +969,7 @@ function vProgress(){
   if(n) h+=card(`<h3>Fuel</h3><div class="stats">${stat('Calories / day',n.target,`TDEE ≈ ${n.tdee}${n.offset?` · coach offset ${n.offset>0?'+':''}${n.offset}`:''}`)}${stat('Protein / day',n.protein+' g',`${n.proteinRange[0]}–${n.proteinRange[1]} g`)}${stat('Goal pace',n.goalRate+' kg/wk')}</div><p class="small">${esc(n.advice)}</p><p class="muted xs">Fat loss is driven mostly by the calorie deficit; the training preserves and builds muscle while it happens. High protein and 7–9 k steps/day help. Estimates only.</p>`);
   const rows=E.TESTS.map(t=>{ const s=E.testSeries(S,t.id); if(!s.length) return ''; const f=s[0].v,l=s[s.length-1].v,d=Math.round((l-f)*10)/10;
     return `<tr data-act="chartTest" data-id="${t.id}" class="${U.chart===t.id?'sel':''}"><td>${esc(t.name)}</td><td>${f}</td><td>${s.length>2?s[s.length-2].v:'–'}</td><td><b>${l}</b></td><td class="${d>0?'up':d<0?'down':''}">${d>0?'+':''}${s.length>1?d:''}</td></tr>`; }).join('');
-  h+=card(`<h3>Benchmarks</h3>${rows?`<table class="tt"><tr><th></th><th>Base</th><th>Prev</th><th>Now</th><th>Δ</th></tr>${rows}</table>${U.chart?chart([{pts:E.testSeries(S,U.chart).map(x=>({x:E.dnum(x.date),y:x.v})),cls:'s2',r:3.5}],{h:110}):'<p class="muted xs">Tap a row for its chart.</p>'}`:'<p class="muted">Do the baseline test first.</p>'}<button data-act="startTest" class="ghost">Retest now</button>`);
+  h+=card(`<h3>Benchmarks</h3>${rows?`<table class="tt"><tr><th></th><th>Base</th><th>Prev</th><th>Now</th><th>Δ</th></tr>${rows}</table>${U.chart?chart([{pts:E.testSeries(S,U.chart).map(x=>({x:E.dnum(x.date),y:x.v})),cls:'s2',r:3.5}],{h:110}):'<p class="muted xs">Tap a row for its chart.</p>'}`:'<p class="muted">Do the baseline test first.</p>'}<div class="row gap"><button data-act="startTest" class="ghost grow">Retest now</button>${S.tests.length?`<button data-act="editTest" class="ghost grow">${S.tests.length===1?'Redo baseline':'Edit latest test'}</button>`:''}</div>${(S.tests[S.tests.length-1]||{}).notes?`<p class="muted small pre">Test notes: ${esc(S.tests[S.tests.length-1].notes)}</p>`:''}`);
   h+=card(`<h3>Skill levels</h3>${Object.keys(E.TRACKS).map(t=>{ const cap=E.gateCap(S,t), e=E.currentEx(S,t), n2=E.P[t].length, lv=cap<0?0:E.effLevel(S,t);
     return `<div class="lvl"><div class="row"><span class="grow">${esc(E.TRACKS[t].name)}</span><span class="muted xs">${cap<0?'locked':(lv+1)+'/'+n2}</span></div><div class="bar"><i style="width:${cap<0?0:((lv+1)/n2*100)}%"></i></div><div class="xs">${cap<0?'Unlocks when you have chin-ups and ring dip negatives':esc(e.name)}${S.tracks[t].level>lv&&cap>=0?' <span class="muted">(gated by handstand level)</span>':''}</div></div>`; }).join('')}`);
   const ev=S.events.slice(-12).reverse();
@@ -918,10 +978,20 @@ function vProgress(){
 }
 
 // ---------- coach ----------
+function shareBox(){
+  const sh=Object.assign({},E.SHARE_DEFAULT,S.settings.share||{});
+  const b=(k,v,l,on)=>`<button data-act="share" data-k="${k}" data-val="${v}" class="${on?'on':''}">${l}</button>`;
+  return `<details class="more" ${U.shareOpen?'open':''}><summary>What gets shared with Claude</summary>
+    <div class="f"><span>Body measurements</span><div class="seg">${b('body','none','None',sh.body==='none')}${b('body','relative','% changes',sh.body==='relative')}${b('body','full','Full',sh.body==='full')}</div><small>None = only "fat-loss trend: on track / slower / faster". % changes = e.g. "waist −3%" — no kg or cm. Full = weight, waist, body fat, calories.</small></div>
+    <div class="f"><span>Age, sex & height</span><div class="seg">${b('demo','0','Hide',!sh.demo)}${b('demo','1','Share',sh.demo)}</div></div>
+    <div class="f"><span>Pain reports & session/test notes</span><div class="seg">${b('health','0','Hide',!sh.health)}${b('health','1','Share',sh.health)}</div><small>Sharing lets Claude adapt around niggles (e.g. shoulder pain on pushing).</small></div>
+    <p class="muted xs">Always shared: goals, your written answers & training history (edit in More), test results, and workout reps/RIR. Nothing else leaves the phone, and the backup file never goes to Claude. Read the generated prompt before copying it.</p></details>`;
+}
 function vCoach(){
   const last=S.checkins.length?S.checkins[S.checkins.length-1].date:null, mi=E.mesoInfo(S);
   let h=card(`<h2>Coach check-in</h2><p>The app does all the planning maths offline. Every 4–6 weeks (after a retest), copy this prompt into Claude. It asks you a few questions, then returns an adjustment block you paste back here. This is the only part that uses your Claude account.</p><p class="muted small">Last check-in: ${last||'never'} · Meso ${mi.n}, week ${Math.min(mi.week,mi.len)}/${mi.len}${mi.testDue?' · <b>retest due</b>':''}</p>
     ${seg('u','promptMode',U.promptMode,[['checkin','Progress check-in'],['goals','Goals deep-dive']])}
+    ${shareBox()}
     <button data-act="genPrompt" class="primary">Generate prompt</button>
     ${U.prompt?`<textarea id="promptBox" rows="8" readonly>${esc(U.prompt)}</textarea><div class="row gap"><button data-act="copyPrompt" class="primary grow">Copy prompt</button><a class="btn" href="https://claude.ai/new" target="_blank" rel="noopener">Open Claude</a></div>`:''}`);
   h+=card(`<h3>Paste Claude's reply</h3><p class="muted small">Paste the whole final reply (or just the json block).</p><textarea data-bind="adj.text" rows="5" placeholder='…\`\`\`json {"rbw_adjust": …} \`\`\`'>${esc(U.adjText)}</textarea><button data-act="previewAdj">Preview changes</button>
@@ -933,10 +1003,10 @@ function vCoach(){
 // ---------- more ----------
 function vMore(){
   const p=S.profile;
-  let h=card(`<h3>Profile & goals</h3><div class="grid2">${inp('p','height',p.height,'Height (cm)',{num:1})}${inp('p','birthYear',p.birthYear,'Birth year',{num:1})}${inp('p','targetWeight',p.targetWeight,'Target weight',{num:1})}${inp('p','targetWaist',p.targetWaist,'Target waist',{num:1})}${inp('p','minutes',p.minutes,'Minutes / session',{num:1})}${inp('p','maxDb',p.maxDb,'Max dumbbell (kg)',{num:1})}</div>${seg('p','focus',p.focus,[['fat','Lose fat'],['recomp','Recomp'],['muscle','Build muscle']],'Focus')}${seg('p','activity',p.activity,[['sedentary','Sedentary'],['light','Light'],['active','Active']],'Daily activity')}${area('pg','short',(p.goals||{}).short,'Short-term goal notes')}${area('pg','long',(p.goals||{}).long,'Long-term goal notes')}<button data-act="reonboard" class="ghost">Redo the full goals questionnaire</button>`);
+  let h=card(`<h3>Profile & goals</h3><div class="grid2">${inp('p','height',p.height,'Height (cm)',{num:1})}${inp('p','birthYear',p.birthYear,'Birth year',{num:1})}${inp('p','targetWeight',p.targetWeight,'Target weight',{num:1})}${inp('p','targetWaist',p.targetWaist,'Target waist',{num:1})}${inp('p','minutes',p.minutes,'Minutes / session',{num:1})}${inp('p','maxDb',p.maxDb,'Max dumbbell (kg)',{num:1})}</div>${seg('p','focus',p.focus,[['fat','Lose fat'],['recomp','Recomp'],['muscle','Build muscle']],'Focus')}${seg('p','activity',p.activity,[['sedentary','Sedentary'],['light','Light'],['active','Active']],'Daily activity')}${area('ph','history',p.history||'','Training history (shared with Claude as written)')}${area('pg','short',(p.goals||{}).short,'Short-term goal notes')}${area('pg','long',(p.goals||{}).long,'Long-term goal notes')}<button data-act="reonboard" class="ghost">Redo the full goals questionnaire</button>`);
   h+=card(`<h3>Program</h3>${seg('st','mesoWeeks',S.settings.mesoWeeks,[[4,'4 wk'],[5,'5 wk'],[6,'6 wk']],'Mesocycle length (last week = deload, then retest)')}<p class="muted xs">Rotation position: next is "${esc(E.nextTemplate(S).name)}".</p>`);
   h+=card(`<h3>Levels & sets</h3><p class="muted xs">Override what the engine chose. Sets = working sets per session (auto-adjusted from soreness & RIR).</p>${Object.keys(E.TRACKS).map(t=>`<div class="lvrow"><span>${esc(E.TRACKS[t].name)}</span><select data-bind="lvl.${t}">${E.P[t].map((e,i)=>`<option value="${i}" ${S.tracks[t].level===i?'selected':''}>${i+1}. ${esc(e.name)}</option>`).join('')}</select>${E.ADJUSTABLE(t)?`<input class="num" type="number" min="1" max="6" data-bind="sets.${t}" value="${S.tracks[t].sets}">`:'<span></span>'}</div>`).join('')}`);
-  h+=card(`<h3>Backup</h3><p class="muted small">Data lives only in this browser on this phone. Export a backup regularly (e.g. to Google Drive), especially before clearing browser data.</p><div class="row gap"><button data-act="export" class="primary grow">Export backup</button><label class="btn grow">Import<input type="file" accept="application/json,.json" id="importFile" hidden></label></div>`);
+  h+=card(`<h3>Backup</h3><p class="muted small">Data lives only in this browser on this phone. Export a backup regularly (e.g. to Google Drive), especially before clearing browser data.</p><div class="row gap"><button data-act="export" class="primary grow">Export backup</button><label class="btn grow">Restore…<input type="file" accept="application/json,.json" id="importFile" hidden></label></div><label class="btn" style="width:100%;margin-top:8px">Merge sessions & body log from a backup<input type="file" accept="application/json,.json" id="mergeFile" hidden></label><p class="muted xs">Restore replaces everything. Merge only adds sessions and measurements that aren't already here (keeps your current tests, levels and settings).</p>`);
   h+=card(`<h3>Install on your phone</h3><p class="small">In Chrome on the S23+: open this page → ⋮ menu → <b>Add to Home screen</b> → Install. It then opens full-screen and works offline. Voice logging uses Chrome's speech service (free, needs internet); offline, use the keyboard's mic key in the text box.</p>`);
   h+=card(`<h3>Danger zone</h3><button data-act="reset" class="danger">Erase all data</button>`);
   return h;
@@ -948,8 +1018,18 @@ function modal(){
   if(U.modal==='sore'){
     m=`<h2>Soreness check</h2><p class="muted small">Since you last trained these, how did they recover? (This sets today's volume.)</p>${U.soreGroups.map(g=>`<div class="f"><span>${E.GROUP_NAMES[g]}</span><div class="seg wrap">${SORE.map(([l,v])=>`<button data-act="sore" data-g="${g}" data-v="${v}" class="${U.sore[g]===v?'on':''}">${l}</button>`).join('')}</div></div>`).join('')}<div class="row gap"><button data-act="closeModal" class="ghost">Cancel</button><button data-act="beginSore" class="primary grow">Start</button></div>`;
   } else if(U.modal==='finish'){
-    const f=U.fin; if(f.effort==null&&S.active&&S.active.effort) f.effort=S.active.effort;
+    const f=U.fin; if(S.active){ if(f.effort==null&&S.active.effort) f.effort=S.active.effort; if(!f.notes&&S.active.notes) f.notes=S.active.notes; if(f.pain==='none'&&S.active.pain) f.pain=S.active.pain; }
     m=`<h2>How was it?</h2><div class="f"><span>Overall session effort</span><div class="seg wrap">${[1,2,3,4,5].map(v=>`<button data-act="seg" data-ns="fin" data-k="effort" data-val="${v}" class="${+f.effort===v?'on':''}">${EFFORT[v]}</button>`).join('')}</div></div><div class="f"><span>Any joint pain (not muscle burn)?</span><div class="seg wrap">${['none','wrist','shoulder','elbow','knee','back'].map(v=>`<button data-act="seg" data-ns="fin" data-k="pain" data-val="${v}" class="${f.pain===v?'on':''}">${v}</button>`).join('')}</div></div>${area('fin','notes',f.notes,'Notes (optional)','sleep, stress, what felt good…')}<div class="row gap"><button data-act="closeModal" class="ghost">Back</button><button data-act="finish" class="primary grow">Save session</button></div>`;
+  } else if(U.modal==='editSess'){
+    const e=U.es;
+    m=`<h2>Edit session</h2>${inp('es','date',e.date,'Date',{ph:'YYYY-MM-DD'})}
+    <div class="f"><span>Session effort</span><div class="seg wrap">${[1,2,3,4,5].map(v=>`<button data-act="seg" data-ns="es" data-k="effort" data-val="${v}" class="${+e.effort===v?'on':''}">${EFFORT[v]}</button>`).join('')}</div></div>
+    <div class="f"><span>Joint pain</span><div class="seg wrap">${['none','wrist','shoulder','elbow','knee','back'].map(v=>`<button data-act="seg" data-ns="es" data-k="pain" data-val="${v}" class="${e.pain===v?'on':''}">${v}</button>`).join('')}</div></div>
+    ${area('es','notes',e.notes,'Notes')}
+    <h3>Sets <span class="muted xs">(value · RIR — clear a value to remove the set)</span></h3>
+    ${Object.keys(e.entries).map(id=>{const ex=E.EX[id]; return `<div class="small"><b>${esc(ex?ex.name:id)}</b></div><div class="esets">${e.entries[id].map((x,k)=>`<span><input class="num" type="number" inputmode="decimal" step="any" data-bind="esv.${id}.${k}" value="${esc(x.v)}"><input class="num sm" type="number" inputmode="numeric" min="0" max="4" data-bind="esr.${id}.${k}" value="${esc(x.rir??'')}" placeholder="RIR"></span>`).join('')}</div>`;}).join('')||'<p class="muted small">No sets (notes-only entry).</p>'}
+    <p class="muted xs">Edits fix your history and future targets; level changes the session already caused aren't recalculated (adjust in More → Levels).</p>
+    <div class="row gap"><button data-act="closeModal" class="ghost">Cancel</button><button data-act="saveSess" class="primary grow">Save</button></div>`;
   } else if(U.modal==='summary'){
     const s=U.summary; m=`<h2>${esc(s.title)}</h2><ul class="changes">${s.lines.map(l=>`<li>${s.html?l:esc(l)}</li>`).join('')}</ul>${s.foot?`<p class="muted small">${esc(s.foot)}</p>`:''}<button data-act="closeModal" class="primary">OK</button>`;
   }
@@ -961,10 +1041,10 @@ const ACT={
   view:t=>{ U.view=t.dataset.v; U.parsed=null; render(); window.scrollTo(0,0); },
   ob:t=>{ const d=+t.dataset.d; if(d>0&&U.ob===4) return finishOnboard(); if(d>0&&U.ob===1){ const x=U.draft; if(!x.height||!x.weight||!x.birthYear||!x.waist) return toast('Please fill birth year, height, weight and waist.'); } U.ob=Math.max(0,U.ob+d); render(); window.scrollTo(0,0); },
   seg:t=>{ const ns=t.dataset.ns,k=t.dataset.k,v=t.dataset.val;
-    if(ns==='d') draft()[k]=v; else if(ns==='fin') U.fin[k]=k==='effort'?+v:v; else if(ns==='u') U[k]=v;
+    if(ns==='d') draft()[k]=v; else if(ns==='es') U.es[k]=k==='effort'?+v:v; else if(ns==='fin') U.fin[k]=k==='effort'?+v:v; else if(ns==='u') U[k]=v;
     else if(ns==='p'){ S.profile[k]=v; save(); } else if(ns==='st'){ S.settings[k]=+v; save(); }
     render(); },
-  startTest:()=>{ U.view='test'; U.testVals={}; render(); window.scrollTo(0,0); },
+  startTest:()=>{ U.view='test'; U.testEdit=null; U.testVals={}; U.testNotes=''; render(); window.scrollTo(0,0); },
   saveTest,
   start:t=>startSession(t.dataset.t),
   skip:()=>{ S.rotation=(S.rotation||0)+1; save(); render(); },
@@ -981,7 +1061,22 @@ const ACT={
   mic, parse:doParse, applyParsed,
   dropParsed:t=>{ U.parsed.splice(+t.dataset.j,1); if(!U.parsed.length) U.parsed=null; render(); },
   cancelParsed:()=>{ U.parsed=null; render(); },
-  saveBody:()=>{ const b=U.bodyForm; if(!/^\d{4}-\d\d-\d\d$/.test(b.date||'')) return toast('Date must be YYYY-MM-DD'); if(E.addBody(S,b)){ U.bodyForm={date:E.today()}; save(); render(); toast('Saved ✓'); } else toast('Enter at least one measurement.'); },
+  saveBody:()=>{ const b=U.bodyForm; if(!/^\d{4}-\d\d-\d\d$/.test(b.date||'')) return toast('Date must be YYYY-MM-DD');
+    let old=null; if(U.bodyEdit){ old=S.body.find(x=>x.date===U.bodyEdit); S.body=S.body.filter(x=>x.date!==U.bodyEdit&&x.date!==b.date); }
+    if(E.addBody(S,b)){ U.bodyForm={date:E.today()}; U.bodyEdit=null; save(); render(); toast('Saved ✓'); }
+    else { if(old){ if(confirm('All values are empty — delete this entry?')){ U.bodyEdit=null; U.bodyForm={date:E.today()}; save(); render(); } else { S.body.push(old); S.body.sort((x,y)=>x.date<y.date?-1:1); } } else toast('Enter at least one measurement.'); } },
+  editBody:t=>{ const b=S.body.find(x=>x.date===t.dataset.d); if(!b) return; U.bodyEdit=b.date; U.bodyForm={date:b.date,weight:b.weight??'',waist:b.waist??'',neck:b.neck??'',hip:b.hip??''}; render(); const c=document.getElementById('bodyCard'); if(c) c.scrollIntoView({behavior:'smooth',block:'start'}); },
+  cancelBody:()=>{ U.bodyEdit=null; U.bodyForm={date:E.today()}; render(); },
+  editSess:t=>{ const s=S.sessions.find(x=>x.id===t.dataset.id); if(!s) return; U.es=JSON.parse(JSON.stringify({id:s.id,date:s.date,effort:s.effort||null,pain:s.pain||'none',notes:s.notes||'',entries:s.entries})); U.modal='editSess'; render(); },
+  saveSess:()=>{ const s=S.sessions.find(x=>x.id===U.es.id); if(!s) return; const e=U.es;
+    if(!/^\d{4}-\d\d-\d\d$/.test(e.date)) return toast('Date must be YYYY-MM-DD');
+    for(const id in e.entries){ e.entries[id]=e.entries[id].filter(x=>x.v!==''&&x.v!=null).map(x=>Object.assign(x,{v:+x.v,rir:(x.rir===''||x.rir==null)?null:+x.rir})); if(!e.entries[id].length) delete e.entries[id]; }
+    Object.assign(s,{date:e.date,effort:e.effort,pain:e.pain,notes:e.notes.trim(),entries:e.entries}); S.sessions.sort((a,b)=>a.date<b.date?-1:a.date>b.date?1:0);
+    U.es=null; U.modal=null; save(); render(); toast('Session updated ✓'); },
+  allNote:()=>{ U.parsed=[{kind:'note',text:U.qtext.trim(),raw:U.qtext}]; const p=E.parseUtterance(U.qtext,S).find(a=>a.pain); if(p) U.parsed[0].pain=p.pain; render(); },
+  editTest:()=>{ const i=S.tests.length-1; if(i<0) return; const t=S.tests[i]; U.testEdit=i; U.testVals=Object.assign({},t.results); U.testNotes=t.notes||''; U.testBody={}; U.view='test'; render(); window.scrollTo(0,0); },
+  cancelTest:()=>{ U.testEdit=null; U.testVals={}; U.testNotes=''; U.view=S.tests.length?'progress':'today'; render(); },
+  share:t=>{ U.shareOpen=true; S.settings.share=S.settings.share||{}; const k=t.dataset.k, v=t.dataset.val; S.settings.share[k]=k==='body'?v:v==='1'; U.prompt=''; save(); render(); },
   delBody:t=>{ if(confirm('Delete measurements for '+t.dataset.d+'?')){ S.body=S.body.filter(b=>b.date!==t.dataset.d); save(); render(); } },
   delSess:t=>{ if(confirm('Delete this session?')){ S.sessions=S.sessions.filter(s=>s.id!==t.dataset.id); save(); render(); } },
   chartTest:t=>{ U.chart=U.chart===t.dataset.id?null:t.dataset.id; render(); },
@@ -1012,9 +1107,14 @@ function onField(e){
     case 'q': U.qtext=val; break;
     case 'adj': U.adjText=val; break;
     case 'fin': U.fin[k]=val; break;
+    case 'es': U.es[k]=val; break;
+    case 'esv': U.es.entries[k][+parts[2]].v=val; break;
+    case 'esr': U.es.entries[k][+parts[2]].rir=val; break;
+    case 'tn': U.testNotes=val; break;
     case 'set': { const p=S.active&&S.active.items[+k]; if(p){ p.rows[+parts[2]].v=val; if(isChange) save(); } break; }
     case 'iload': { const p=S.active&&S.active.items[+k]; if(p){ p.load=val===''?null:+val; if(isChange) save(); } break; }
     case 'p': if(isChange){ S.profile[k]=(val!==''&&!isNaN(+val)&&k!=='perWeek')?+val:val; save(); } break;
+    case 'ph': if(isChange){ S.profile.history=val; save(); } break;
     case 'pg': if(isChange){ S.profile.goals=S.profile.goals||{}; S.profile.goals[k]=val; save(); } break;
     case 'lvl': if(isChange){ const ts=S.tracks[k]; ts.level=+val; ts.load=null; ts.struggle=0; S.events.push({date:E.today(),type:'manual',track:k,to:+val}); save(); render(); } break;
     case 'sets': if(isChange&&+val>=1){ S.tracks[k].sets=Math.min(6,+val); save(); } break;
@@ -1022,6 +1122,11 @@ function onField(e){
 }
 document.addEventListener('input',onField); document.addEventListener('change',onField);
 document.addEventListener('keydown',e=>{ if(e.key==='Enter'&&e.target.id==='qtext'){ U.qtext=e.target.value; doParse(); } });
+document.addEventListener('change',e=>{ if(e.target.id!=='mergeFile') return; const f=e.target.files[0]; if(!f) return; const r=new FileReader(); r.onload=()=>{ try{ const o=JSON.parse(r.result); if(!o||!Array.isArray(o.sessions)) throw new Error('Not a RingBar backup');
+  const ids=new Set(S.sessions.map(s=>s.id)), dates=new Set(S.body.map(b=>b.date)); let ns=0,nb=0;
+  o.sessions.forEach(s=>{ if(!ids.has(s.id)){ S.sessions.push(s); ns++; } }); (o.body||[]).forEach(b=>{ if(!dates.has(b.date)){ S.body.push(b); nb++; } });
+  S.sessions.sort((a,b)=>a.date<b.date?-1:a.date>b.date?1:0); S.body.sort((a,b)=>a.date<b.date?-1:1); save(); render(); toast(`Merged ${ns} sessions, ${nb} measurements ✓`);
+  }catch(err){ toast('Merge failed: '+err.message); } e.target.value=''; }; r.readAsText(f); });
 document.addEventListener('change',e=>{ if(e.target.id!=='importFile') return; const f=e.target.files[0]; if(!f) return; const r=new FileReader(); r.onload=()=>{ try{ const o=JSON.parse(r.result); if(!o||!o.tracks||!Array.isArray(o.sessions)) throw new Error('Not a RingBar backup'); if(confirm('Replace current data with this backup?')){ S=E.migrate(o); save(); render(); toast('Backup restored ✓'); } }catch(err){ toast('Import failed: '+err.message); } }; r.readAsText(f); });
 
 render();
